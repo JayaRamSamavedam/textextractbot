@@ -1,0 +1,156 @@
+const https = require('https');
+const AWS = require('aws-sdk');
+
+const textract = new AWS.Textract();
+
+exports.handler = async (event) => {
+    try {
+        if (event.body) {
+            const body = JSON.parse(event.body);
+
+            // Check if the event is from a Telegram message
+            if (body.message) {
+                const chat_id = body.message.chat.id;
+
+                // Check for the "/start" command
+                if (body.message.text && body.message.text === '/start') {
+                    await sendTelegramMessage(chat_id, "Hi! Welcome to your Textract Bot. Please upload a photo for analysis.");
+                    return {
+                        statusCode: 200,
+                        body: "Start command received"
+                    };
+                }
+
+                // Check for a photo in the message
+                if (body.message.photo) {
+                    // Download the photo from Telegram
+                    const file_id = body.message.photo[body.message.photo.length - 1].file_id;
+                    const image_bytes = await downloadTelegramFile(file_id);
+
+                    // Analyze the document with Textract
+                    const response = await textract.detectDocumentText({ Document: { Bytes: image_bytes } }).promise();
+
+                    // Extract relevant information from Textract response
+                    const text_blocks = response.Blocks.filter(block => block.BlockType === 'LINE').map(block => block.Text);
+                    const result_message_html = formatAsCodeBlockHTML(text_blocks.join('\n'));
+
+                    // Send the result back to the user on Telegram as a reply to the original photo
+                    const reply_to_message_id = body.message.message_id;
+                    await sendTelegramMessage(chat_id, `Text Extracted:\n${result_message_html}`, reply_to_message_id);
+
+                    return {
+                        statusCode: 200,
+                        body: "Analysis completed"
+                    };
+                }
+
+                // If it's neither the "/start" command nor a photo, provide a default response
+                const defaultResponse = "Please click 👉  /start to  extracting text by uploading a photo.";
+                await sendTelegramMessage(chat_id, defaultResponse);
+
+                return {
+                    statusCode: 200,
+                    body: "Default response sent"
+                };
+            }
+
+            return {
+                statusCode: 200,
+                body: "Unknown event type"
+            };
+        } else {
+            return {
+                statusCode: 400,
+                body: "Invalid request format"
+            };
+        }
+    } catch (error) {
+        console.error(error);
+        return {
+            statusCode: 500,
+            body: JSON.stringify(error)
+        };
+    }
+};
+
+function formatAsCodeBlockHTML(message) {
+    // Wrap the message in HTML code block for copy-pasting
+    return `<pre>${message}</pre>`;
+}
+
+async function downloadTelegramFile(file_id) {
+    // Download the photo from Telegram and return the content
+    const bot_token = process.env.HTTP_TOKEN;
+    const file_info = await getFileInfo(bot_token, file_id);
+    const file_url = `https://api.telegram.org/file/bot${bot_token}/${file_info.file_path}`;
+
+    return new Promise((resolve, reject) => {
+        https.get(file_url, (response) => {
+            let data = Buffer.from([]);
+
+            response.on('data', (chunk) => {
+                data = Buffer.concat([data, chunk]);
+            });
+
+            response.on('end', () => {
+                resolve(data);
+            });
+        }).on('error', (error) => {
+            reject(error);
+        });
+    });
+}
+
+async function getFileInfo(bot_token, file_id) {
+    return new Promise((resolve, reject) => {
+        https.get(`https://api.telegram.org/bot${bot_token}/getFile?file_id=${file_id}`, (response) => {
+            let data = '';
+
+            response.on('data', (chunk) => {
+                data += chunk;
+            });
+
+            response.on('end', () => {
+                resolve(JSON.parse(data).result);
+            });
+        }).on('error', (error) => {
+            reject(error);
+        });
+    });
+}
+
+async function sendTelegramMessage(chat_id, message, reply_to_message_id) {
+    // Send a message to the Telegram chat in HTML format
+    const bot_token = process.env.HTTP_TOKEN;
+    const payload = JSON.stringify({
+        chat_id: chat_id,
+        text: message,
+        reply_to_message_id: reply_to_message_id, // Added parameter for replying to a specific message
+        parse_mode: 'HTML', // Set parse_mode to HTML
+    });
+
+    const options = {
+        hostname: 'api.telegram.org',
+        path: `/bot${bot_token}/sendMessage`,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload)
+        },
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(options, (res) => {
+            res.on('end', () => {
+                resolve();
+            });
+        });
+
+        req.on('error', (error) => {
+            reject(error);
+        });
+
+        req.write(payload);
+        req.end();
+    });
+}
